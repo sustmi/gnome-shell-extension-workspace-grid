@@ -116,6 +116,7 @@
 
 ////////// CODE ///////////
 const Clutter = imports.gi.Clutter;
+const Gio = imports.gi.Gio;
 const Lang = imports.lang;
 const Mainloop = imports.mainloop;
 const Meta = imports.gi.Meta;
@@ -135,6 +136,10 @@ const ExtensionUtils = imports.misc.extensionUtils;
 const Me = ExtensionUtils.getCurrentExtension();
 const Convenience = Me.imports.convenience;
 const Prefs = Me.imports.prefs;
+
+const OVERRIDE_SCHEMA = WorkspaceThumbnail.OVERRIDE_SCHEMA;
+const ANIMATION_TIME = WorkspaceSwitcher.ANIMATION_TIME;
+const DISPLAY_TIMEOUT = WorkspaceSwitcher.DISPLAY_TIMEOUT;
 
 const KEY_ROWS = Prefs.KEY_ROWS;
 const KEY_COLS = Prefs.KEY_COLS;
@@ -289,268 +294,6 @@ function moveWorkspace(direction) {
     }
 }
 
-// GNOME 3.6: _redraw --> _redisplay
-/************
- * Workspace Switcher that can do rows and columns as opposed to just rows.
- ************/
-const WorkspaceSwitcherPopup = new Lang.Class({
-    Name: 'WorkspaceSwitcherPopup',
-    Extends: WorkspaceSwitcher.WorkspaceSwitcherPopup,
-
-    // note: this makes sure everything fits vertically and then adjust the
-    // horizontal to fit.
-    _getPreferredHeight : function (actor, forWidth, alloc) {
-        let children = this._list.get_children(),
-            primary = Main.layoutManager.primaryMonitor,
-            nrows = global.screen.workspace_grid.rows,
-            availHeight = primary.height,
-            height = 0,
-            spacing = this._itemSpacing * (nrows - 1);
-
-        availHeight -= Main.panel.actor.height;
-        availHeight -= this.actor.get_theme_node().get_vertical_padding();
-        availHeight -= this._container.get_theme_node().get_vertical_padding();
-        availHeight -= this._list.get_theme_node().get_vertical_padding();
-
-        for (let i = 0; i < global.screen.n_workspaces;
-                i += global.screen.workspace_grid.columns) {
-            let [childMinHeight, childNaturalHeight] =
-                children[i].get_preferred_height(-1);
-            children[i].get_preferred_width(childNaturalHeight);
-            height += childNaturalHeight * primary.width / primary.height;
-        }
-
-        height += spacing;
-
-        height = Math.min(height, availHeight);
-        this._childHeight = (height - spacing) / nrows;
-
-        // check for horizontal overflow and adjust.
-        let childHeight = this._childHeight;
-        this._getPreferredWidth(actor, -1, {});
-        if (childHeight !== this._childHeight) {
-            // the workspaces will overflow horizontally and ._childWidth &
-            // ._childHeight have been adjusted to make it fit.
-            height = this._childHeight * nrows + spacing;
-            if (height > availHeight) {
-                this._childHeight = (availHeight - spacing) / nrows;
-            }
-        }
-
-        alloc.min_size = height;
-        alloc.natural_size = height;
-    },
-
-    _getPreferredWidth : function (actor, forHeight, alloc) {
-        let primary = Main.layoutManager.primaryMonitor,
-            ncols = global.screen.workspace_grid.columns;
-        this._childWidth = this._childHeight * primary.width / primary.height;
-        let width = this._childWidth * ncols + this._itemSpacing * (ncols - 1),
-            padding = this.actor.get_theme_node().get_horizontal_padding() +
-                      this._list.get_theme_node().get_horizontal_padding() +
-                      this._container.get_theme_node().get_horizontal_padding();
-
-        // but constrain to at most primary.width
-        if (width + padding > primary.width) {
-            this._childWidth = (primary.width - padding -
-                                this._itemSpacing * (ncols - 1)) / ncols;
-            this._childHeight = this._childWidth * primary.height /
-                                primary.width;
-            width = primary.width - padding;
-        }
-
-        alloc.min_size = width;
-        alloc.natural_size = width;
-    },
-
-    _allocate : function (actor, box, flags) {
-        let children = this._list.get_children(),
-            childBox = new Clutter.ActorBox(),
-            x = box.x1,
-            y = box.y1,
-            prevX = x,
-            prevY = y,
-            i = 0;
-        for (let row = 0; row < global.screen.workspace_grid.rows; ++row) {
-            x = box.x1;
-            prevX = x;
-            for (let col = 0; col < global.screen.workspace_grid.columns; ++col) {
-                childBox.x1 = prevX;
-                childBox.x2 = Math.round(x + this._childWidth);
-                childBox.y1 = prevY;
-                childBox.y2 = Math.round(y + this._childHeight);
-
-                x += this._childWidth + this._itemSpacing;
-                prevX = childBox.x2 + this._itemSpacing;
-                children[i].allocate(childBox, flags);
-                i++;
-                if (i >= MAX_WORKSPACES) {
-                    break;
-                }
-            }
-            if (i >= MAX_WORKSPACES) {
-                break;
-            }
-            prevY = childBox.y2 + this._itemSpacing;
-            y += this._childHeight + this._itemSpacing;
-        }
-    },
-
-    // GNOME 3.6: old _redraw + _position is now combined into _redisplay
-    // Also, workspace switcher is *destroyed* whenever it fades out.
-    // Previously it was stored.
-    _redisplay: function () {
-        //log('redisplay, direction ' + this._direction + ', going to ' + this._activeWorkspaceIndex);
-        this._list.destroy_all_children();
-
-        for (let i = 0; i < global.screen.n_workspaces; i++) {
-            let indicator = null;
-            let name = Meta.prefs_get_workspace_name(i);
-
-            if (i === this._activeWorkspaceIndex &&
-                   this._direction === UP) {
-                indicator = new St.Bin({
-                    style_class: 'ws-switcher-active-up'
-                });
-            } else if (i === this._activeWorkspaceIndex &&
-                   this._direction === DOWN) {
-                indicator = new St.Bin({
-                    style_class: 'ws-switcher-active-down'
-                });
-            } else if (i === this._activeWorkspaceIndex &&
-                   this._direction === LEFT) {
-                indicator = new St.Bin({
-                    style_class: 'ws-switcher-active-left'
-                });
-            } else if (i === this._activeWorkspaceIndex &&
-                   this._direction === RIGHT) {
-                indicator = new St.Bin({
-                    style_class: 'ws-switcher-active-right'
-                });
-            } else {
-                indicator = new St.Bin({style_class: 'ws-switcher-box'});
-            }
-            if (settings.get_boolean(KEY_SHOW_WORKSPACE_LABELS) && i !== this._activeWorkspaceIndex) {
-                indicator.child = new St.Label({
-                    text: name,
-                    style_class: 'ws-switcher-label'
-                });
-            }
-
-            this._list.add_actor(indicator);
-        }
-
-        let primary = Main.layoutManager.primaryMonitor;
-        let [containerMinHeight, containerNatHeight] = this._container.get_preferred_height(global.screen_width);
-        let [containerMinWidth, containerNatWidth] = this._container.get_preferred_width(containerNatHeight);
-        this._container.x = primary.x + Math.floor((primary.width - containerNatWidth) / 2);
-        this._container.y = primary.y + Main.panel.actor.height +
-                            Math.floor(((primary.height - Main.panel.actor.height) - containerNatHeight) / 2);
-    }
-
-});
-
-/* Keybinding handler.
- * Should bring up a workspace switcher.
- * Either activates the target workspace or if it's move-to-workspace-xxx
- * we should move the window as well as show the workspace switcher.
- * This is the same as WindowManager._showWorkspaceSwitcher but we don't
- * filter out RIGHT/LEFT actions like they do.
- */
-function showWorkspaceSwitcher(display, screen, window, binding) {
-    if (global.screen.n_workspaces === 1)
-        return;
-
-    let direction = BindingToDirection[binding.get_name()],
-        to;
-    if (binding.get_name().substr(0, 5) === 'move-') {
-        // we've patched this
-        to = Main.wm.actionMoveWindow(window, direction);
-    } else {
-        // we've patched this
-        to = Main.wm.actionMoveWorkspace(direction);
-    }
-
-    // show workspace switcher
-    if (!Main.overview.visible) {
-        getWorkspaceSwitcherPopup().display(direction, to.index());
-    }
-}
-
-/******************
- * Overrides the 'switch_to_workspace_XXX' keybindings
- * Relevant code in js/windowManager.js
- ******************/
-function overrideKeybindingsAndPopup() {
-    // note - we could simply replace Main.wm._workspaceSwitcherPopup and
-    // not bother with taking over the keybindings, if not for the 'wraparound'
-    // stuff.
-    let bindings = Object.keys(BindingToDirection);
-    for (let i = 0; i < bindings.length; ++i) {
-        Main.wm.setCustomKeybindingHandler(bindings[i],
-                                           Shell.KeyBindingMode.NORMAL |
-                                           Shell.KeyBindingMode.OVERVIEW,
-                                           showWorkspaceSwitcher);
-	}
-
-    // Override imports.ui.windowManager.actionMove* just in case other
-    // extensions use them.
-    wmStorage.actionMoveWorkspace = WMProto.actionMoveWorkspace;
-    WMProto.actionMoveWorkspace = function (direction) {
-        let from = global.screen.get_active_workspace_index(),
-            to = calculateWorkspace(direction,
-                    settings.get_boolean(KEY_WRAPAROUND),
-                    settings.get_boolean(KEY_WRAP_TO_SAME)),
-            ws = global.screen.get_workspace_by_index(to);
-
-        if (to !== from) {
-            ws.activate(global.get_current_time());
-        }
-        return ws;
-    };
-    wmStorage.actionMoveWindow = WMProto.actionMoveWindow;
-    WMProto.actionMoveWindow = function (window, direction) {
-        let to = calculateWorkspace(direction,
-                settings.get_boolean(KEY_WRAPAROUND),
-                settings.get_boolean(KEY_WRAP_TO_SAME)),
-            ws = global.screen.get_workspace_by_index(to);
-
-        if (to !== global.screen.get_active_workspace_index()) {
-            Main.wm._movingWindow = window;
-            window.change_workspace(ws);
-            global.display.clear_mouse_mode();
-            ws.activate_with_focus(window, global.get_current_time());
-        }
-        return ws;
-    };
-}
-
-/* Restore the original keybindings */
-function unoverrideKeybindingsAndPopup() {
-    let bindings = Object.keys(BindingToDirection);
-    for (let i = 0; i < bindings.length; ++i) {
-        Main.wm.setCustomKeybindingHandler(bindings[i],
-                                               Shell.KeyBindingMode.NORMAL |
-                                               Shell.KeyBindingMode.OVERVIEW,
-                                               Lang.bind(Main.wm,
-                                                   Main.wm._showWorkspaceSwitcher));
-    }
-
-    _workspaceSwitcherPopup = null;
-
-    WMProto.actionMoveWorkspace = wmStorage.actionMoveWorkspace;
-    WMProto.actionMoveWindow = wmStorage.actionMoveWindow;
-}
-
-// GNOME 3.2 & 3.4: Main.overview._workspacesDisplay
-// GNOME 3.6, 3.8: Main.overview._viewSelector._workspacesDisplay
-function _getWorkspaceDisplay() {
-    return Main.overview._workspacesDisplay || Main.overview._viewSelector._workspacesDisplay;
-}
-
-/******************
- * Overrides the workspaces display in the overview
- ******************/
 const ThumbnailsBox = new Lang.Class({
     Name: 'ThumbnailsBox',
     Extends: WorkspaceThumbnail.ThumbnailsBox,
@@ -986,6 +729,193 @@ const ThumbnailsBox = new Lang.Class({
         this._settings.disconnect(this._dynamicWorkspacesId);
     }
 });
+
+// GNOME 3.6: _redraw --> _redisplay
+/************
+ * Workspace Switcher that can do rows and columns as opposed to just rows.
+ ************/
+const WorkspaceSwitcherPopup = new Lang.Class({
+    Name: 'WorkspaceSwitcherPopup',
+    Extends: WorkspaceSwitcher.WorkspaceSwitcherPopup,
+
+		_workspaceSwitcherPopupThumbnailsExtension: {},
+
+    _init: function() {
+        let ext = this._workspaceSwitcherPopupThumbnailsExtension;
+        
+        this.actor = new St.Widget({ reactive: true,
+                                     x: 0,
+                                     y: 0,
+                                     width: global.screen_width,
+                                     height: global.screen_height,
+                                     style_class: 'workspace-switcher-group' });
+        Main.uiGroup.add_actor(this.actor);
+        
+        ext.thumbnailsBox = new ThumbnailsBox();
+        ext.thumbnailsBox._createThumbnails();
+        ext.thumbnailsBox._background.set_style('border: 1px solid rgba(128, 128, 128, 0.4); \
+                                                 border-radius: 9px; \
+                                                 padding: 11px;');
+        
+        this.actor.add_actor(ext.thumbnailsBox.actor);
+        
+        this._redisplay();
+        
+        ext.timeoutId = Mainloop.timeout_add(DISPLAY_TIMEOUT, Lang.bind(this, this._onTimeout));
+    },
+    
+    display: function(direction, activeWorkspaceIndex) {
+        let ext = this._workspaceSwitcherPopupThumbnailsExtension;
+        
+        this._redisplay();
+        
+        if (ext.timeoutId != 0)
+            Mainloop.source_remove(ext.timeoutId);
+        ext.timeoutId = Mainloop.timeout_add(DISPLAY_TIMEOUT, Lang.bind(this, this._onTimeout));
+    },
+    
+    _redisplay: function() {
+        let ext = this._workspaceSwitcherPopupThumbnailsExtension;
+				
+        let workArea = Main.layoutManager.getWorkAreaForMonitor(Main.layoutManager.primaryIndex);
+        
+        let [containerMinHeight, containerNatHeight] = ext.thumbnailsBox.actor.get_preferred_height(global.screen_width);
+        let [containerMinWidth, containerNatWidth] = ext.thumbnailsBox.actor.get_preferred_width(containerNatHeight);
+        
+        this.actor.x = workArea.x + Math.floor((workArea.width - containerNatWidth) / 2);
+        this.actor.y = workArea.y + Math.floor((workArea.height - containerNatHeight) / 2);
+    },
+    
+    _onTimeout: function() {
+        let ext = this._workspaceSwitcherPopupThumbnailsExtension;
+        
+        Mainloop.source_remove(ext.timeoutId);
+        ext.timeoutId = 0;
+        Tweener.addTween(ext.thumbnailsBox.actor, { opacity: 0.0,
+                                                    time: ANIMATION_TIME,
+                                                    transition: 'easeOutQuad',
+                                                    onComplete: function() { this.destroy(); },
+                                                    onCompleteScope: this });
+    },
+    
+    destroy: function() {
+        let ext = this._workspaceSwitcherPopupThumbnailsExtension;
+        
+        if (ext.timeoutId) {
+            this._onTimeout();
+        }
+        
+        ext.thumbnailsBox._destroyThumbnails();
+        ext.thumbnailsBox.destroy();
+        this.actor.destroy();
+
+        this.emit('destroy');
+    }
+
+});
+
+/* Keybinding handler.
+ * Should bring up a workspace switcher.
+ * Either activates the target workspace or if it's move-to-workspace-xxx
+ * we should move the window as well as show the workspace switcher.
+ * This is the same as WindowManager._showWorkspaceSwitcher but we don't
+ * filter out RIGHT/LEFT actions like they do.
+ */
+function showWorkspaceSwitcher(display, screen, window, binding) {
+    if (global.screen.n_workspaces === 1)
+        return;
+
+    let direction = BindingToDirection[binding.get_name()],
+        to;
+    if (binding.get_name().substr(0, 5) === 'move-') {
+        // we've patched this
+        to = Main.wm.actionMoveWindow(window, direction);
+    } else {
+        // we've patched this
+        to = Main.wm.actionMoveWorkspace(direction);
+    }
+
+    // show workspace switcher
+    if (!Main.overview.visible) {
+        getWorkspaceSwitcherPopup().display(direction, to.index());
+    }
+}
+
+/******************
+ * Overrides the 'switch_to_workspace_XXX' keybindings
+ * Relevant code in js/windowManager.js
+ ******************/
+function overrideKeybindingsAndPopup() {
+    // note - we could simply replace Main.wm._workspaceSwitcherPopup and
+    // not bother with taking over the keybindings, if not for the 'wraparound'
+    // stuff.
+    let bindings = Object.keys(BindingToDirection);
+    for (let i = 0; i < bindings.length; ++i) {
+        Main.wm.setCustomKeybindingHandler(bindings[i],
+                                           Shell.KeyBindingMode.NORMAL |
+                                           Shell.KeyBindingMode.OVERVIEW,
+                                           showWorkspaceSwitcher);
+	}
+
+    // Override imports.ui.windowManager.actionMove* just in case other
+    // extensions use them.
+    wmStorage.actionMoveWorkspace = WMProto.actionMoveWorkspace;
+    WMProto.actionMoveWorkspace = function (direction) {
+        let from = global.screen.get_active_workspace_index(),
+            to = calculateWorkspace(direction,
+                    settings.get_boolean(KEY_WRAPAROUND),
+                    settings.get_boolean(KEY_WRAP_TO_SAME)),
+            ws = global.screen.get_workspace_by_index(to);
+
+        if (to !== from) {
+            ws.activate(global.get_current_time());
+        }
+        return ws;
+    };
+    wmStorage.actionMoveWindow = WMProto.actionMoveWindow;
+    WMProto.actionMoveWindow = function (window, direction) {
+        let to = calculateWorkspace(direction,
+                settings.get_boolean(KEY_WRAPAROUND),
+                settings.get_boolean(KEY_WRAP_TO_SAME)),
+            ws = global.screen.get_workspace_by_index(to);
+
+        if (to !== global.screen.get_active_workspace_index()) {
+            Main.wm._movingWindow = window;
+            window.change_workspace(ws);
+            global.display.clear_mouse_mode();
+            ws.activate_with_focus(window, global.get_current_time());
+        }
+        return ws;
+    };
+}
+
+/* Restore the original keybindings */
+function unoverrideKeybindingsAndPopup() {
+    let bindings = Object.keys(BindingToDirection);
+    for (let i = 0; i < bindings.length; ++i) {
+        Main.wm.setCustomKeybindingHandler(bindings[i],
+                                               Shell.KeyBindingMode.NORMAL |
+                                               Shell.KeyBindingMode.OVERVIEW,
+                                               Lang.bind(Main.wm,
+                                                   Main.wm._showWorkspaceSwitcher));
+    }
+
+    _workspaceSwitcherPopup = null;
+
+    WMProto.actionMoveWorkspace = wmStorage.actionMoveWorkspace;
+    WMProto.actionMoveWindow = wmStorage.actionMoveWindow;
+}
+
+// GNOME 3.2 & 3.4: Main.overview._workspacesDisplay
+// GNOME 3.6, 3.8: Main.overview._viewSelector._workspacesDisplay
+function _getWorkspaceDisplay() {
+    return Main.overview._workspacesDisplay || Main.overview._viewSelector._workspacesDisplay;
+}
+
+/******************
+ * Overrides the workspaces display in the overview
+ ******************/
+
 
 /* Get the thumbnails box to acknowledge a change in allowable width */
 function refreshThumbnailsBox() {
